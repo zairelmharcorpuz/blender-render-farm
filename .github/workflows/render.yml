@@ -1,0 +1,230 @@
+name: Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      blend_path:
+        description: "Path to a .blend file in this repo (empty = generate demo scene)"
+        type: string
+        required: false
+        default: ""
+      frame_start:
+        description: "First frame"
+        type: number
+        required: true
+        default: 1
+      frame_end:
+        description: "Last frame"
+        type: number
+        required: true
+        default: 48
+      workers:
+        description: "Parallel render jobs (frame chunks)"
+        type: number
+        required: true
+        default: 4
+      samples:
+        description: "Cycles samples per frame"
+        type: number
+        required: true
+        default: 32
+      resolution_x:
+        description: "Output width"
+        type: number
+        required: true
+        default: 640
+      resolution_y:
+        description: "Output height"
+        type: number
+        required: true
+        default: 360
+      fps:
+        description: "FPS for the assembled video"
+        type: number
+        required: true
+        default: 24
+      assemble_video:
+        description: "Assemble an MP4 from all frames"
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  BLENDER_VERSION: "4.2.23"
+
+jobs:
+  plan:
+    name: Plan chunks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      chunks: ${{ steps.split.outputs.chunks }}
+    steps:
+      - name: Split frame range into chunks
+        id: split
+        env:
+          FRAME_START: ${{ inputs.frame_start }}
+          FRAME_END: ${{ inputs.frame_end }}
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          set -euo pipefail
+          start=$((FRAME_START)); end=$((FRAME_END)); workers=$((WORKERS))
+          if (( start > end )); then echo "::error::frame_start ($start) > frame_end ($end)"; exit 1; fi
+          if (( workers < 1 )); then echo "::error::workers must be >= 1"; exit 1; fi
+          total=$(( end - start + 1 ))
+          if (( workers > total )); then workers=$total; fi
+          per=$(( (total + workers - 1) / workers ))
+          chunks="["
+          for (( i=0; i<workers; i++ )); do
+            s=$(( start + i * per ))
+            e=$(( s + per - 1 ))
+            if (( e > end )); then e=$end; fi
+            if (( s > end )); then break; fi
+            if (( i > 0 )); then chunks+=","; fi
+            chunks+="{\"index\":$i,\"start\":$s,\"end\":$e}"
+          done
+          chunks+="]"
+          echo "chunks=$chunks" >> "$GITHUB_OUTPUT"
+          echo "Planned chunks: $chunks"
+
+  render:
+    name: Frames ${{ matrix.chunk.start }}-${{ matrix.chunk.end }}
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: ${{ fromJSON(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Blender runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 \
+            libxkbcommon0 libsm6 libice6 libgl1 libegl1 xz-utils
+
+      - name: Cache Blender ${{ env.BLENDER_VERSION }}
+        uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Install Blender
+        run: |
+          set -euo pipefail
+          if [ ! -x "$HOME/blender/blender" ]; then
+            curl -fsSL -o /tmp/blender.tar.xz \
+              "https://download.blender.org/release/Blender4.2/blender-${BLENDER_VERSION}-linux-x64.tar.xz"
+            mkdir -p "$HOME/blender"
+            tar -xJf /tmp/blender.tar.xz -C "$HOME/blender" --strip-components=1
+          fi
+          "$HOME/blender/blender" --version | head -n 1
+
+      - name: Prepare scene
+        env:
+          BLEND_PATH: ${{ inputs.blend_path }}
+        run: |
+          set -euo pipefail
+          if [ -n "$BLEND_PATH" ]; then
+            if [ ! -f "$BLEND_PATH" ]; then
+              echo "::error::blend file not found in repo: $BLEND_PATH"
+              exit 1
+            fi
+            echo "BLEND=$PWD/$BLEND_PATH" >> "$GITHUB_ENV"
+          else
+            "$HOME/blender/blender" -b --python scripts/setup_demo.py
+            echo "BLEND=$PWD/scene.blend" >> "$GITHUB_ENV"
+          fi
+
+      - name: Render chunk
+        env:
+          SAMPLES: ${{ inputs.samples }}
+          RES_X: ${{ inputs.resolution_x }}
+          RES_Y: ${{ inputs.resolution_y }}
+          CHUNK_START: ${{ matrix.chunk.start }}
+          CHUNK_END: ${{ matrix.chunk.end }}
+        run: |
+          set -euo pipefail
+          mkdir -p frames
+          "$HOME/blender/blender" -b "$BLEND" \
+            -P scripts/apply_settings.py \
+            -o "$PWD/frames/frame_####" \
+            -s "$CHUNK_START" -e "$CHUNK_END" -a
+
+      - name: Upload frames
+        uses: actions/upload-artifact@v4
+        with:
+          name: frames-${{ matrix.chunk.index }}
+          path: frames/*.png
+          if-no-files-found: error
+          retention-days: 7
+
+  collect:
+    name: Collect and assemble
+    needs: render
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Download all frames
+        uses: actions/download-artifact@v4
+        with:
+          pattern: frames-*
+          path: frames
+          merge-multiple: true
+
+      - name: Verify frame count
+        env:
+          FRAME_START: ${{ inputs.frame_start }}
+          FRAME_END: ${{ inputs.frame_end }}
+        run: |
+          set -euo pipefail
+          expected=$(( FRAME_END - FRAME_START + 1 ))
+          actual=$(find frames -name '*.png' | wc -l)
+          echo "expected=$expected actual=$actual"
+          if [ "$actual" -ne "$expected" ]; then
+            echo "::error::Expected $expected frames, got $actual"
+            exit 1
+          fi
+
+      - name: Package frames
+        run: |
+          set -euo pipefail
+          command -v zip >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zip; }
+          (cd frames && zip -q -r ../all-frames.zip .)
+
+      - name: Assemble video
+        if: ${{ inputs.assemble_video }}
+        env:
+          FRAME_START: ${{ inputs.frame_start }}
+          FPS: ${{ inputs.fps }}
+        run: |
+          set -euo pipefail
+          command -v ffmpeg >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg; }
+          ffmpeg -y -framerate "$FPS" -start_number "$FRAME_START" \
+            -i "frames/frame_%04d.png" \
+            -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+            -c:v libx264 -pix_fmt yuv420p -movflags +faststart \
+            render.mp4
+
+      - name: Upload frames zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-frames
+          path: all-frames.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload video
+        if: ${{ inputs.assemble_video }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-video
+          path: render.mp4
+          if-no-files-found: error
+          retention-days: 7
